@@ -2,14 +2,16 @@
 
 **1. Indexes**
 
-I created four indexes:
+The application creates six indexes:
 
 - `employees.emp_code` (unique) — enforces uniqueness so concurrent POST `/employees` requests yield exactly one 201 and the rest 409, without a pre-check read.
-- `employees.(department, emp_code)` — covers the `list_employees` filter + sort without hitting the collection scan path.
-- `attendance_logs.(emp_code, date)` (unique) — the primary key of every attendance record; makes the PATCH lookup O(1) and prevents duplicate punch-ins atomically.
-- `attendance_logs.(date DESC, emp_code ASC)` — matches the sort order required by `GET /attendance`, so the list query is a covered index scan at any scale.
+- `employees.(department, emp_code)` — supports the department filter and employee-code sort in `GET /employees`.
+- `employees.joined_on` — supports month-end eligibility filters in the department analytics.
+- `attendance_logs.(emp_code, date)` (unique) — prevents duplicate attendance records for the same employee and date, and supports the regularization lookup.
+- `attendance_logs.(date DESC, emp_code ASC)` — matches the sort order required by `GET /attendance`; the query still fetches documents, so it is not a covered query.
+- `attendance_logs.date` — supports date-range analytics filters.
 
-I considered a sparse index on `punch_in` to speed up the punch-out lookup ("most recent open record"). I rejected it because punch-out is a point-write on a single employee — the `(emp_code, date)` index already narrows the scan to that employee's records, and the typical employee has at most a handful of open records at once.
+I did not add a partial index for open punch records. It could help the punch-out lookup at larger scale, but the expected per-employee history is small and the extra index would add write/storage cost.
 
 **2. Punch-in race**
 
@@ -25,4 +27,4 @@ I run a separate aggregation on the `employees` collection (filtered to `joined_
 
 **5. One thing I would change at 100× scale**
 
-I would replace the Python-loop trend computation with a proper `$densify` + `$fill` MongoDB aggregation pipeline so the database handles gap-filling and windowed moving averages server-side. At 100× data the per-day Python loop is still fine (max 92 iterations), but pulling thousands of log rows per request would become the bottleneck. A server-side pipeline with a covering index on `(department, date)` would cut network round-trips and memory pressure significantly.
+I would avoid loading all matching attendance logs into the API process. The trend endpoint is currently computed in Python for a maximum 92-day range. At larger data volumes, I would move the employee/log join and daily calculations into MongoDB aggregation, then measure whether server-side gap filling and window calculations improve latency. The existing `(emp_code, date)` attendance index can support the employee/date lookup; there is no `department` field on attendance records to index directly.

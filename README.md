@@ -7,10 +7,14 @@ A FastAPI + MongoDB API for tracking employee punch-in/out and computing attenda
 ```bash
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # set MONGO_URI and MONGO_DB
-python sample_seed.py
+# Optional: set MONGO_URI and MONGO_DB in your shell or in a local .env file.
 uvicorn app.main:app --port 8000 --reload
 ```
+
+The default connection is `mongodb://localhost:27017` and the default database is
+`attendance_db`. Start MongoDB before using the API. No seed script is included;
+create employees and attendance records through the API or load your own fixtures.
+Run the focused unit tests with `python -m unittest discover -s tests`.
 
 MongoDB **6.0 or newer** required (tested on 7.0). A free MongoDB Atlas M0 cluster works.
 
@@ -21,9 +25,9 @@ MongoDB **6.0 or newer** required (tested on 7.0). A free MongoDB Atlas M0 clust
 | `MONGO_URI` | `mongodb://localhost:27017`   | MongoDB connection    |
 | `MONGO_DB`  | `attendance_db`               | Database name         |
 
-## What is implemented
+## Implemented routes
 
-All endpoints in the OpenAPI contract:
+The routes currently implemented are:
 
 - `GET  /health` – MongoDB ping probe
 - `POST /employees` – create employee (unique index, concurrent-safe)

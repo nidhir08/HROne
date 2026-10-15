@@ -5,10 +5,11 @@ Run:  uvicorn app.main:app --port 8000
 Env:  MONGO_URI, MONGO_DB  (loaded from .env for convenience)
 """
 
-import math
 import os
 import re
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, ROUND_HALF_UP
+from threading import Lock
 from typing import Any, Optional
 
 from dotenv import load_dotenv
@@ -41,15 +42,17 @@ app = FastAPI(
 
 
 # ---------------------------------------------------------------------------
-# Index creation (idempotent; runs once at startup)
+# Index creation (idempotent; initialized at startup and retried as needed)
 # ---------------------------------------------------------------------------
+_indexes_ready = False
+_index_lock = Lock()
+
+
 @app.on_event("startup")
 def create_indexes() -> None:
     """
-    Create indexes on startup. Wrapped in try/except so the process starts
-    even if MongoDB is temporarily unreachable; indexes will be created on the
-    first successful request that reaches this code path.
-    Indexes are idempotent – safe to call on every startup.
+    Try to create indexes on startup. If MongoDB is temporarily unavailable,
+    write endpoints retry before relying on unique-index guarantees.
     """
     try:
         _ensure_indexes()
@@ -58,21 +61,37 @@ def create_indexes() -> None:
 
 
 def _ensure_indexes() -> None:
-    # employees – unique on emp_code so concurrent creates yield exactly one 201
-    db.employees.create_index("emp_code", unique=True)
-    db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
-    db.employees.create_index("joined_on")
+    global _indexes_ready
+    if _indexes_ready:
+        return
 
-    # attendance_logs – unique on (emp_code, date); covers list + analytics
-    db.attendance_logs.create_index(
-        [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True
-    )
-    # date-descending, emp_code-ascending for the list endpoint's sort
-    db.attendance_logs.create_index(
-        [("date", DESCENDING), ("emp_code", ASCENDING)]
-    )
-    # date range queries only
-    db.attendance_logs.create_index("date")
+    with _index_lock:
+        if _indexes_ready:
+            return
+
+        # employees – unique on emp_code so concurrent creates yield exactly one 201
+        db.employees.create_index("emp_code", unique=True)
+        db.employees.create_index([("department", ASCENDING), ("emp_code", ASCENDING)])
+        db.employees.create_index("joined_on")
+
+        # attendance_logs – unique on (emp_code, date)
+        db.attendance_logs.create_index(
+            [("emp_code", ASCENDING), ("date", ASCENDING)], unique=True
+        )
+        # Supports the list endpoint's date-descending, emp-code-ascending sort.
+        db.attendance_logs.create_index(
+            [("date", DESCENDING), ("emp_code", ASCENDING)]
+        )
+        db.attendance_logs.create_index("date")
+        _indexes_ready = True
+
+
+def _ensure_write_indexes() -> None:
+    """Do not accept uniqueness-sensitive writes until indexes are available."""
+    try:
+        _ensure_indexes()
+    except Exception as exc:
+        raise HTTPException(503, detail="MongoDB indexes unavailable") from exc
 
 
 # ---------------------------------------------------------------------------
@@ -87,6 +106,34 @@ def _to_ist(dt: datetime) -> datetime:
 def _truncate_seconds(dt: datetime) -> datetime:
     """Truncate to whole seconds (R1 – 09:40:00.900 → 09:40:00)."""
     return dt.replace(microsecond=0)
+
+
+def _parse_iso_date(value: str, field_name: str) -> date:
+    """Parse a strict YYYY-MM-DD date or return a client-facing 422 error."""
+    if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", value):
+        raise HTTPException(422, detail=f"{field_name} must use YYYY-MM-DD format")
+    try:
+        return date.fromisoformat(value)
+    except ValueError as exc:
+        raise HTTPException(422, detail=f"{field_name} must be a valid date") from exc
+
+
+def _month_bounds(month: str) -> tuple[str, str]:
+    """Return inclusive ISO date bounds for YYYY-MM, rejecting year zero."""
+    if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+        raise HTTPException(422, detail="month must use YYYY-MM format")
+    year, month_number = map(int, month.split("-"))
+    try:
+        start = date(year, month_number, 1)
+    except ValueError as exc:
+        raise HTTPException(422, detail="month must be a valid calendar month") from exc
+    if month_number == 12:
+        if year == date.max.year:
+            return start.isoformat(), date.max.isoformat()
+        next_month = date(year + 1, 1, 1)
+    else:
+        next_month = date(year, month_number + 1, 1)
+    return start.isoformat(), (next_month - timedelta(days=1)).isoformat()
 
 
 def _attendance_date(punch_in_ist: datetime, shift_start: str, shift_end: str) -> str:
@@ -111,13 +158,19 @@ def _attendance_date(punch_in_ist: datetime, shift_start: str, shift_end: str) -
     return punch_in_ist.date().isoformat()
 
 
-def _compute_late_minutes(punch_in_ist: datetime, shift_start: str) -> int:
+def _compute_late_minutes(
+    punch_in_ist: datetime, shift_start: str, attendance_date: str
+) -> int:
     """
     R2: Grace period is 10 minutes (strictly more than 10:00 after shift_start).
     late_minutes = floor(elapsed since shift_start), not since grace end.
     """
     h, m = map(int, shift_start.split(":"))
-    shift_start_dt = punch_in_ist.replace(hour=h, minute=m, second=0, microsecond=0)
+    shift_date = _parse_iso_date(attendance_date, "attendance_date")
+    shift_start_dt = datetime(
+        shift_date.year, shift_date.month, shift_date.day,
+        hour=h, minute=m, second=0, microsecond=0, tzinfo=IST,
+    )
     elapsed = int((punch_in_ist - shift_start_dt).total_seconds())  # signed seconds
     if elapsed <= 600:  # <= 10:00 → not late
         return 0
@@ -129,8 +182,11 @@ def _compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     R4: (punch_out - punch_in) / 3600, rounded to 2 decimals half-up.
     Python's built-in round() uses banker's rounding; we need half-up.
     """
-    raw = (punch_out - punch_in).total_seconds() / 3600
-    return _round_half_up(raw, 2)
+    seconds = Decimal(str((punch_out - punch_in).total_seconds()))
+    hours = (seconds / Decimal(3600)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return float(hours)
 
 
 def _compute_overtime_minutes(
@@ -160,9 +216,9 @@ def _compute_overtime_minutes(
 
 
 def _round_half_up(value: float, decimals: int) -> float:
-    """Half-up rounding (not banker's)."""
-    factor = 10 ** decimals
-    return math.floor(value * factor + 0.5) / factor
+    """Round half-up without relying on binary floating-point tie behavior."""
+    quantum = Decimal(1).scaleb(-decimals)
+    return float(Decimal(str(value)).quantize(quantum, rounding=ROUND_HALF_UP))
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +324,17 @@ class EmployeeIn(BaseModel):
     def validate_department(cls, v: str) -> str:
         if not v or len(v) > 50:
             raise ValueError("department must be 1-50 characters")
+        return v
+
+    @field_validator("joined_on")
+    @classmethod
+    def validate_joined_on(cls, v: str) -> str:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", v):
+            raise ValueError("joined_on must use YYYY-MM-DD format")
+        try:
+            date.fromisoformat(v)
+        except ValueError as exc:
+            raise ValueError("joined_on must be a valid date") from exc
         return v
 
     @field_validator("shift_start", "shift_end")
@@ -380,6 +447,7 @@ def health():
 @app.post("/employees", status_code=201, tags=["employees"])
 def create_employee(body: EmployeeIn):
     """Create an employee. emp_code uniqueness is enforced by a DB index."""
+    _ensure_write_indexes()
     doc = body.model_dump()
     doc["created_at"] = datetime.now(tz=timezone.utc)
     try:
@@ -422,6 +490,7 @@ def punch_in(body: PunchInIn):
     Record a punch-in. Uses a unique index on (emp_code, date) to prevent
     duplicate inserts even under concurrent identical requests.
     """
+    _ensure_write_indexes()
     emp = db.employees.find_one({"emp_code": body.emp_code})
     if not emp:
         raise HTTPException(404, detail="employee not found")
@@ -435,7 +504,7 @@ def punch_in(body: PunchInIn):
     ts_ist = _to_ist(ts_utc)
 
     date_str = _attendance_date(ts_ist, emp["shift_start"], emp["shift_end"])
-    late_min = _compute_late_minutes(ts_ist, emp["shift_start"])
+    late_min = _compute_late_minutes(ts_ist, emp["shift_start"], date_str)
 
     doc = {
         "emp_code":         body.emp_code,
@@ -539,6 +608,10 @@ def list_attendance(
     Sorted by date descending then emp_code ascending.
     Uses cursor-based DB queries (not in-memory). date_from > date_to → 422.
     """
+    if date_from is not None:
+        _parse_iso_date(date_from, "date_from")
+    if date_to is not None:
+        _parse_iso_date(date_to, "date_to")
     if date_from and date_to and date_from > date_to:
         raise HTTPException(422, detail="date_from must not be after date_to")
 
@@ -576,6 +649,7 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
     Manually correct a record. Appends one history entry with only changed
     fields. Concurrent edits: atomic findOneAndUpdate prevents silent loss.
     """
+    _parse_iso_date(date, "date")
     emp = db.employees.find_one({"emp_code": emp_code})
     if not emp:
         raise HTTPException(404, detail="employee not found")
@@ -630,7 +704,7 @@ def regularize(emp_code: str, date: str, body: RegularizeIn):
         new_half      = False
     else:
         pi_ist = _to_ist(new_punch_in)
-        new_late = _compute_late_minutes(pi_ist, emp["shift_start"])
+        new_late = _compute_late_minutes(pi_ist, emp["shift_start"], date)
         if new_punch_out is not None:
             new_work_h = _compute_work_hours(new_punch_in, new_punch_out)
             po_ist     = _to_ist(new_punch_out)
@@ -727,14 +801,7 @@ def employee_monthly(
     if not emp:
         raise HTTPException(404, detail="employee not found")
 
-    year, mon = map(int, month.split("-"))
-    # Month boundaries
-    month_start = datetime(year, mon, 1).date().isoformat()
-    if mon == 12:
-        month_end = datetime(year + 1, 1, 1).date()
-    else:
-        month_end = datetime(year, mon + 1, 1).date()
-    month_end_str = (month_end - timedelta(days=1)).isoformat()
+    month_start, month_end_str = _month_bounds(month)
 
     joined_on = emp["joined_on"]  # YYYY-MM-DD string
     # Effective start for working days is max(month_start, joined_on)
@@ -837,13 +904,7 @@ def department_summary(
     One row per department. Headcount includes employees with zero logs (R9).
     avg_work_hours: mean over presence records that have work_hours (R8 rounding).
     """
-    year, mon = map(int, month.split("-"))
-    month_start = datetime(year, mon, 1).date().isoformat()
-    if mon == 12:
-        month_end_d = datetime(year + 1, 1, 1).date() - timedelta(days=1)
-    else:
-        month_end_d = datetime(year, mon + 1, 1).date() - timedelta(days=1)
-    month_end_str = month_end_d.isoformat()
+    month_start, month_end_str = _month_bounds(month)
 
     emp_match: dict[str, Any] = {"joined_on": {"$lte": month_end_str}}
     if department:
@@ -941,7 +1002,8 @@ def department_summary(
     ]
 
     if department:
-        agg_pipe.insert(1, {"$match": {"emp_info.department": department}})
+        # emp_info only exists after $lookup and $unwind (stages 1 and 2).
+        agg_pipe.insert(3, {"$match": {"emp_info.department": department}})
 
     log_stats = {r["_id"]: r for r in db.attendance_logs.aggregate(agg_pipe)}
 
@@ -985,13 +1047,7 @@ def late_leaderboard(
     Standard competition ranking by total_late_minutes descending.
     limit applies after ranking (ties at the cutoff are all included).
     """
-    year, mon = map(int, month.split("-"))
-    month_start = datetime(year, mon, 1).date().isoformat()
-    if mon == 12:
-        month_end_d = datetime(year + 1, 1, 1).date() - timedelta(days=1)
-    else:
-        month_end_d = datetime(year, mon + 1, 1).date() - timedelta(days=1)
-    month_end_str = month_end_d.isoformat()
+    month_start, month_end_str = _month_bounds(month)
 
     match_stage: dict[str, Any] = {
         "date":         {"$gte": month_start, "$lte": month_end_str},
@@ -1064,15 +1120,15 @@ def department_trend(
     to_date:    str = Query(..., alias="to"),
 ):
     """
-    Daily attendance trend for a department. Uses $densify to fill gaps.
+    Daily attendance trend for a department. Fills missing dates in Python.
     Returns exactly one row per calendar day from from_date to to_date inclusive.
     """
     # Validation
-    if to_date < from_date:
+    from_d = _parse_iso_date(from_date, "from")
+    to_d = _parse_iso_date(to_date, "to")
+    if to_d < from_d:
         raise HTTPException(422, detail="'to' must not be before 'from'")
 
-    from_d = datetime.fromisoformat(from_date).date()
-    to_d   = datetime.fromisoformat(to_date).date()
     if (to_d - from_d).days > 91:  # 92 days means max range = 92 calendar days
         raise HTTPException(422, detail="date range cannot exceed 92 days")
 
@@ -1191,6 +1247,10 @@ def explain_endpoint(
         raise HTTPException(422, detail=f"endpoint must be one of {sorted(valid_endpoints)}")
 
     if endpoint == "attendance_list":
+        if date_from is not None:
+            _parse_iso_date(date_from, "date_from")
+        if date_to is not None:
+            _parse_iso_date(date_to, "date_to")
         if date_from and date_to and date_from > date_to:
             raise HTTPException(422, detail="date_from must not be after date_to")
         q: dict[str, Any] = {}
@@ -1223,13 +1283,7 @@ def explain_endpoint(
             raise HTTPException(422, detail="month is required for employee_monthly")
         if not emp_code:
             raise HTTPException(422, detail="emp_code is required for employee_monthly")
-        year, mon = map(int, month.split("-"))
-        ms = datetime(year, mon, 1).date().isoformat()
-        me = (
-            datetime(year + 1, 1, 1).date() - timedelta(days=1)
-            if mon == 12
-            else datetime(year, mon + 1, 1).date() - timedelta(days=1)
-        ).isoformat()
+        ms, me = _month_bounds(month)
         pipeline = [
             {"$match": {"emp_code": emp_code, "date": {"$gte": ms, "$lte": me}}}
         ]
@@ -1243,13 +1297,7 @@ def explain_endpoint(
     elif endpoint == "department_summary":
         if not month:
             raise HTTPException(422, detail="month is required for department_summary")
-        year, mon = map(int, month.split("-"))
-        ms = datetime(year, mon, 1).date().isoformat()
-        me = (
-            datetime(year + 1, 1, 1).date() - timedelta(days=1)
-            if mon == 12
-            else datetime(year, mon + 1, 1).date() - timedelta(days=1)
-        ).isoformat()
+        _, me = _month_bounds(month)
         emp_match: dict[str, Any] = {"joined_on": {"$lte": me}}
         if department:
             emp_match["department"] = department
@@ -1264,13 +1312,7 @@ def explain_endpoint(
     elif endpoint == "late_leaderboard":
         if not month:
             raise HTTPException(422, detail="month is required for late_leaderboard")
-        year, mon = map(int, month.split("-"))
-        ms = datetime(year, mon, 1).date().isoformat()
-        me = (
-            datetime(year + 1, 1, 1).date() - timedelta(days=1)
-            if mon == 12
-            else datetime(year, mon + 1, 1).date() - timedelta(days=1)
-        ).isoformat()
+        ms, me = _month_bounds(month)
         match_stage: dict[str, Any] = {
             "date":         {"$gte": ms, "$lte": me},
             "late_minutes": {"$gt": 0},
@@ -1288,21 +1330,52 @@ def explain_endpoint(
             raise HTTPException(422, detail="'from' and 'to' are required for department_trend")
         if not department:
             raise HTTPException(422, detail="department is required for department_trend")
-        if to_date < from_date:
+        from_d = _parse_iso_date(from_date, "from")
+        to_d = _parse_iso_date(to_date, "to")
+        if to_d < from_d:
             raise HTTPException(422, detail="'to' must not be before 'from'")
-        q2: dict[str, Any] = {
-            "department": department,
-            "date":       {"$gte": from_date, "$lte": to_date},
-        }
-        cmd = db.command(
+        if (to_d - from_d).days > 91:
+            raise HTTPException(422, detail="date range cannot exceed 92 days")
+
+        employees = list(db.employees.find(
+            {"department": department},
+            {"emp_code": 1, "joined_on": 1, "_id": 0},
+        ))
+        emp_codes = [employee["emp_code"] for employee in employees]
+        employee_explain = db.command(
             "explain",
             {
-                "find":   "attendance_logs",
-                "filter": q2,
+                "find": "employees",
+                "filter": {"department": department},
+                "projection": {"emp_code": 1, "joined_on": 1, "_id": 0},
             },
             verbosity="executionStats",
         )
-        return {"endpoint": endpoint, "collection": "attendance_logs", "explain": cmd}
+        attendance_explain = db.command(
+            "explain",
+            {
+                "find": "attendance_logs",
+                "filter": {
+                    "emp_code": {"$in": emp_codes},
+                    "date": {"$gte": from_date, "$lte": to_date},
+                },
+                "projection": {
+                    "date": 1,
+                    "status": 1,
+                    "late_minutes": 1,
+                    "half_day": 1,
+                    "_id": 0,
+                },
+            },
+            verbosity="executionStats",
+        )
+        return {
+            "endpoint": endpoint,
+            "explain": {
+                "employees": employee_explain,
+                "attendance_logs": attendance_explain,
+            },
+        }
 
 
 # ---------------------------------------------------------------------------
